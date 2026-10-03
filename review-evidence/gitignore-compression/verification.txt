@@ -7,7 +7,8 @@ Manual UI verification (isolated ad-hoc signed Release build, not installed):
 - Dismissed the save panel without saving and restored the setting to off.
 
 Automated verification:
-- swift test --package-path Modules: 581 tests in 138 suites passed.
+- swift test --package-path Modules: 582 tests in 138 suites passed.
 - MacPacker Release and MacPacker Store Release Store unsigned builds: passed.
 - scripts/check-architectures.sh: 15 bundled Mach-O files checked; all include arm64 and x86_64.
+- Empty-selection regression reproduced before the fix; all 5 focused tests pass afterward.
 - git diff --check: passed.
