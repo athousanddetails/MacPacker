@@ -1,0 +1,18 @@
+Issue #236 verification
+
+swift test --build-system native --package-path Modules --scratch-path /private/tmp/mp236-tests
+Test run with 586 tests in 139 suites passed after 109.924 seconds.
+
+xcodebuild -scheme MacPacker -configuration Release CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64 build
+BUILD SUCCEEDED
+
+xcodebuild -scheme "MacPacker Store" -configuration "Release Store" CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=YES ARCHS=arm64 build
+BUILD SUCCEEDED
+
+Manual verification using a separately identified review build:
+- Metadata removal starts off; Windows-compatible filenames starts off and disabled.
+- Enabling metadata removal enables the optional filename check.
+- Save As of an archive with CON.txt, bad:name.txt, Readme.txt, README.txt shows all four names and creates no destination archive.
+- Screenshots show baseline Settings, new Settings, and the observed error dialog.
+- Automated write/read tests cover preservation with option off, metadata removal, ordinary AppleDouble-like names, encrypted ZIP/7z, custom folder icons, save/update, source/destination preservation on rejection, and validation of kept and renamed entries.
+- Local build/test verification was arm64. Universal CI is separate.
