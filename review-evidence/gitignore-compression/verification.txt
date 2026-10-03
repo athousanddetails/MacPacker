@@ -1,0 +1,13 @@
+Issue #237: Skip Git-ignored project files when compressing folders
+
+Manual UI verification (isolated ad-hoc signed Release build, not installed):
+- General Settings shows the option and explanation; toggled it on.
+- Quick Compress options reflected the enabled preference.
+- Add to Archive save options reflected the enabled preference.
+- Dismissed the save panel without saving and restored the setting to off.
+
+Automated verification:
+- swift test --package-path Modules: 581 tests in 138 suites passed.
+- MacPacker Release and MacPacker Store Release Store unsigned builds: passed.
+- scripts/check-architectures.sh: 15 bundled Mach-O files checked; all include arm64 and x86_64.
+- git diff --check: passed.
