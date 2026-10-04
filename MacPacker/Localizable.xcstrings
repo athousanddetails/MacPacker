@@ -5,10 +5,6 @@
       "comment": "Settings section for Finder extraction actions",
       "extractionState": "manual"
     },
-    "Show extracted files in Finder": {
-      "comment": "Reveal the results of a Finder extraction action",
-      "extractionState": "manual"
-    },
     "Archive operation in progress": {
       "comment": "Quit confirmation title while extracting or compressing",
       "extractionState": "manual"
@@ -123,6 +119,10 @@
     },
     "Selected archive associations updated.": {
       "comment": "File association success message",
+      "extractionState": "manual"
+    },
+    "Show extracted files in Finder": {
+      "comment": "Reveal the results of a Finder extraction action",
       "extractionState": "manual"
     },
     "Show only progress for Finder actions": {
