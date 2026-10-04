@@ -26,6 +26,12 @@ public enum Keys {
         defaults.object(forKey: confirmTrashAfterExtraction) as? Bool ?? false
     }
 
+    /// Whether a Finder extraction action selects its result in a Finder window.
+    public static let revealExtractedFilesInFinder = "revealExtractedFilesInFinder"
+
+    public static func revealsExtractedFilesInFinder(in defaults: UserDefaults = .standard) -> Bool {
+        defaults.object(forKey: revealExtractedFilesInFinder) as? Bool ?? true
+    }
     public static let smartExtraction = "smartExtraction"
 
     /// `smartExtraction`, read from the app group so the Quick Look extension —

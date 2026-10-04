@@ -5,6 +5,7 @@
 //  Created by Stephan Arenswald on 09.01.26.
 //
 
+import Core
 import FinderMenu
 import FinderSync
 import Foundation
@@ -16,6 +17,7 @@ struct IntegrationSettingsView: View {
     @State var isFinderSyncEnabled: Bool = false
     @AppStorage(FinderMenuSettings.progressOnlyKey, store: FinderMenuSettings.defaults)
     private var progressOnly = false
+    @AppStorage(Keys.revealExtractedFilesInFinder) private var revealExtractedFilesInFinder = true
 
     var body: some View {
         VStack(spacing: 8) {
@@ -100,6 +102,19 @@ struct IntegrationSettingsView: View {
                 .padding(.leading, 8)
                 .toggleStyle(.checkbox)
                 .frame(width: 240, alignment: .leading)
+            }
+
+            Divider()
+
+            HStack(alignment: .top) {
+                Text("After extraction", comment: "Settings section for Finder extraction actions")
+                    .frame(width: 160, alignment: .trailing)
+
+                Toggle(isOn: $revealExtractedFilesInFinder) {
+                    Text("Show extracted files in Finder", comment: "Reveal the results of a Finder extraction action")
+                }
+                .toggleStyle(.checkbox)
+                .frame(width: 248, alignment: .leading)
             }
         }
         .padding()
