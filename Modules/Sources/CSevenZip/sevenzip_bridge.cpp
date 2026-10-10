@@ -19,6 +19,7 @@
 #include <sys/xattr.h>
 #include <utility>
 #include <cerrno>
+#include <dirent.h>
 
 #include "Common/MyWindows.h"
 #include "Common/MyCom.h"
@@ -743,6 +744,8 @@ static void unpackAppleDoubleSidecars(const std::vector<std::string> &sidecars,
                                       const std::set<std::string> &extractedPaths,
                                       const std::string &destDir) {
     const size_t rootLen = destDir.size();
+    std::set<std::string> emptiedMirrorDirs;
+    const std::string mirrorRoot = destDir + "/__MACOSX";
 
     for (const std::string &sidecar : sidecars) {
         const std::string target = appleDoubleTargetPath(sidecar, rootLen);
@@ -807,19 +810,32 @@ static void unpackAppleDoubleSidecars(const std::vector<std::string> &sidecars,
         if (!hadQuarantine)
             removexattr(target.c_str(), kQuarantine, XATTR_NOFOLLOW);
 
-        unlink(sidecar.c_str());
+        if (unlink(sidecar.c_str()) == 0 &&
+            sidecar.compare(0, mirrorRoot.size() + 1, mirrorRoot + "/") == 0) {
+            for (std::string parent = sidecar.substr(0, sidecar.rfind('/'));
+                 parent.size() >= mirrorRoot.size(); parent.erase(parent.rfind('/')))
+                emptiedMirrorDirs.insert(parent);
+        }
     }
 
-    // Emptying a `__MACOSX/` mirror leaves its directories behind, and they are
-    // nothing on their own -- they only ever held sidecars. Deepest first, since
-    // the set is sorted and a child sorts after its parent. rmdir refuses a
-    // directory that still holds something, which is exactly the guard wanted:
-    // anything the archive really kept in there stays, and so does its tree.
-    const std::string sequestered = destDir + kSequesteredDir;
-    for (auto it = extractedPaths.rbegin(); it != extractedPaths.rend(); ++it)
-        if (it->compare(0, sequestered.size(), sequestered) == 0)
-            rmdir(it->c_str());
-    rmdir((destDir + "/__MACOSX").c_str());
+    // Only directories emptied by a consumed sidecar are metadata markers.
+    // macOS rmdir can discard remaining ._ files, so check actual emptiness first:
+    // an orphan or lookalike must survive even beside verified metadata.
+    for (auto it = emptiedMirrorDirs.rbegin(); it != emptiedMirrorDirs.rend(); ++it) {
+        if (extractedPaths.count(*it) == 0) continue;
+        DIR *dir = opendir(it->c_str());
+        if (!dir) continue;
+        bool empty = true;
+        errno = 0;
+        while (const struct dirent *entry = readdir(dir))
+            if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+                empty = false;
+                break;
+            }
+        empty = empty && errno == 0;
+        closedir(dir);
+        if (empty) rmdir(it->c_str());
+    }
 }
 
 // Runs once per entry after its stream is fully written. Restores POSIX metadata
@@ -1042,6 +1058,8 @@ static void sz_indexAppleDoubleSidecars(SZArchiveHandle *handle) {
         if (!fromMirror && !paths[i].empty())
             indexByPath[paths[i]] = i;
 
+        // Only the real tree can establish a target for directory metadata.
+        if (fromMirror) continue;
         for (size_t slash = paths[i].rfind('/'); slash != std::string::npos;
              slash = paths[i].rfind('/', slash - 1)) {
             impliedDirs.insert(paths[i].substr(0, slash));
@@ -1053,12 +1071,6 @@ static void sz_indexAppleDoubleSidecars(SZArchiveHandle *handle) {
 
     for (UInt32 i = 0; i < handle->numItems; i++) {
         const std::string &path = paths[i];
-
-        // The mirror holds sidecars and the directories leading to them, and
-        // nothing else -- so none of it is a file. That includes the `__MACOSX`
-        // root, whose path is empty once the prefix comes off.
-        if (sequestered[i])
-            handle->hiddenSidecars.insert(i);
 
         if (path.empty()) continue;
 
@@ -1089,8 +1101,22 @@ static void sz_indexAppleDoubleSidecars(SZArchiveHandle *handle) {
         }
 
         // Nothing here for it to describe: a file like any other, however it is
-        // named. Left visible unless it came out of the mirror.
+        // named. Left visible even when it came out of the mirror.
         continue;
+    }
+    // Hide only mirror directory markers leading to associated candidates.
+    // Ordinary mirror files, orphan sidecars and independent empty directories
+    // remain visible so a Save As materializes them rather than dropping data.
+    // ponytail: scan per marker; index mirror ancestors if this becomes costly.
+    for (UInt32 i = 0; i < handle->numItems; i++) {
+        if (!sequestered[i] || !sz_entry_is_directory(handle, i)) continue;
+        const std::string prefix = paths[i].empty() ? "" : paths[i] + "/";
+        for (UInt32 sidecar : handle->hiddenSidecars)
+            if (sequestered[sidecar] && !sz_entry_is_directory(handle, sidecar)
+                && paths[sidecar].compare(0, prefix.size(), prefix) == 0) {
+                handle->hiddenSidecars.insert(i);
+                break;
+            }
     }
 }
 
@@ -1293,6 +1319,32 @@ int32_t sz_sidecar_target(SZArchiveRef archive, uint32_t index) {
         for (UInt32 sidecar : pair.second)
             if (sidecar == index) return (int32_t)pair.first;
     return -1;
+}
+
+bool sz_entry_is_directory(SZArchiveRef archive, uint32_t index) {
+    if (!archive) return false;
+    try {
+        auto *handle = static_cast<SZArchiveHandle *>(archive);
+        if (index >= handle->numItems) return false;
+        NWindows::NCOM::CPropVariant prop;
+        return handle->activeArchive()->GetProperty(index, kpidIsDir, &prop) == S_OK
+            && prop.vt == VT_BOOL && prop.boolVal != VARIANT_FALSE;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool sz_entry_is_encrypted(SZArchiveRef archive, uint32_t index) {
+    if (!archive) return false;
+    try {
+        auto *handle = static_cast<SZArchiveHandle *>(archive);
+        if (index >= handle->numItems) return false;
+        NWindows::NCOM::CPropVariant prop;
+        return handle->activeArchive()->GetProperty(index, kpidEncrypted, &prop) == S_OK
+            && prop.vt == VT_BOOL && prop.boolVal != VARIANT_FALSE;
+    } catch (...) {
+        return false;
+    }
 }
 
 /// A string property of one entry, kept alive by the handle; NULL when absent.
