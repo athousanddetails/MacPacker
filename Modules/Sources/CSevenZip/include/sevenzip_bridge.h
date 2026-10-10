@@ -42,6 +42,12 @@ int32_t sz_entry_count(SZArchiveRef archive);
 /// metadata for something it no longer holds.
 int32_t sz_sidecar_target(SZArchiveRef archive, uint32_t index);
 
+/// Directory property for raw entries, including hidden mirror markers.
+bool sz_entry_is_directory(SZArchiveRef archive, uint32_t index);
+
+/// Encryption property for raw entries, including hidden companions.
+bool sz_entry_is_encrypted(SZArchiveRef archive, uint32_t index);
+
 /// The path `index` is stored under, UTF-8, for every entry -- including the
 /// AppleDouble sidecars and `__MACOSX/` mirror entries that `sz_get_entry`
 /// leaves out of the listing. NULL when there is none. Lives as long as the

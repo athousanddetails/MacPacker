@@ -162,7 +162,7 @@ extension SevenZipArchive {
                     { (done: UInt64, total: UInt64) in report(done, total * 2) }
                 }
                 resolved = try materializeKeptEntries(
-                    resolved, from: sourceArchive, into: scratch, progress: firstHalf)
+                    resolved, from: sourceArchive, into: scratch, excludeMacMetadata: options.excludeMacMetadata, progress: firstHalf)
             }
         }
         if !options.excludeMacMetadata {
@@ -235,7 +235,7 @@ extension SevenZipArchive {
                 let path: String
                 if case .move(_, let newPath) = item { path = newPath }
                 else { path = String(cString: raw) }
-                return (path, existing[index]?.isDirectory ?? path.hasSuffix("/"))
+                return (path, existing[index]?.isDirectory ?? sz_entry_is_directory(source.handle.ref, index))
             case .addFile(let path, _, _, _), .addData(let path, _, _, _):
                 return (path, false)
             case .addDirectory(let path, _, _, _):
@@ -288,6 +288,7 @@ extension SevenZipArchive {
         }
 
         var result: [ResolvedItem] = []
+        var removedMetadataPaths: [String] = []
 
         // Build keeps/moves from source entries.
         if let archive = sourceArchive {
@@ -311,8 +312,6 @@ extension SevenZipArchive {
                 let sidecarTarget = sz_sidecar_target(archive.handle.ref, i)
                 if excludeMacMetadata {
                     if finderFiles.contains(i) { continue }
-                    if sidecarTarget >= 0,
-                       try isStoredAppleDouble(i, in: archive, scratch: scratch) { continue }
                 }
                 if sidecarTarget >= 0 && removedIndices.contains(UInt32(sidecarTarget)) { continue }
                 if let newPath = movedIndices[i] {
@@ -324,47 +323,106 @@ extension SevenZipArchive {
         }
 
         result.append(contentsOf: additions)
+        if excludeMacMetadata {
+            let names = try windowsNames(result, source: sourceArchive)
+            var removed: Set<Int> = []
+            // A companion can itself be a target. Resolve shorter target names
+            // first, so metadata removed for `foo` cannot justify removing its
+            // now-orphaned companion for `._foo`. Keep the original write order.
+            // ponytail: scan surviving names per candidate; index if large diffs need it.
+            let candidates = names.indices.filter {
+                !names[$0].1 && sidecarTargetPath(for: names[$0].0) != nil
+            }.sorted {
+                sidecarTargetPath(for: names[$0].0)!.count < sidecarTargetPath(for: names[$1].0)!.count
+            }
+            for index in candidates {
+                let path = names[index].0
+                let target = sidecarTargetPath(for: path)!
+                guard names.indices.contains(where: {
+                    !removed.contains($0) && names[$0].0 != "__MACOSX"
+                        && !names[$0].0.hasPrefix("__MACOSX/")
+                        && (names[$0].0.trimmingCharacters(in: CharacterSet(charactersIn: "/")) == target
+                            || names[$0].0.hasPrefix(target + "/"))
+                }) else { continue }
+                let metadata: Bool
+                switch result[index] {
+                case .addFile(_, let file, _, _): metadata = try isAppleDouble(file)
+                case .addData(_, let data, _, _): metadata = isAppleDoubleHeader(data)
+                case .keep(let sourceIndex), .move(let sourceIndex, _):
+                    metadata = try isStoredAppleDouble(sourceIndex, in: sourceArchive!, scratch: scratch)
+                case .addDirectory: metadata = false
+                }
+                if metadata {
+                    removed.insert(index)
+                    removedMetadataPaths.append(path)
+                }
+            }
+            result = result.enumerated().filter { !removed.contains($0.offset) }.map(\.element)
+            // Only prune mirror markers emptied by verified metadata removal.
+            // A retained file, orphan, lookalike or empty subdirectory keeps its tree.
+            // ponytail: scan per marker; index descendants if large mirrors make this costly.
+            let directories = try windowsNames(result, source: sourceArchive).filter { path, isDirectory in
+                isDirectory && (path == "__MACOSX" || path.hasPrefix("__MACOSX/"))
+            }.map { $0.0.trimmingCharacters(in: CharacterSet(charactersIn: "/")) }
+                .sorted { $0.count > $1.count }
+            for directory in directories where removedMetadataPaths.contains(where: { $0.hasPrefix(directory + "/") }) {
+                let paths = try windowsNames(result, source: sourceArchive).map(\.0)
+                if paths.contains(where: { $0.trimmingCharacters(in: CharacterSet(charactersIn: "/")).hasPrefix(directory + "/") }) { continue }
+                result = zip(result, paths).filter {
+                    $0.1.trimmingCharacters(in: CharacterSet(charactersIn: "/")) != directory
+                }.map(\.0)
+            }
+        }
         return result
     }
 
     /// A sidecar-shaped name alone is not enough: users can have an ordinary
     /// `._notes` beside `notes`. Read its header before removing stored data.
     private static func isStoredAppleDouble(_ index: UInt32, in archive: SevenZipArchive, scratch: URL) throws -> Bool {
-        guard let rawPath = sz_entry_path(archive.handle.ref, index) else { return false }
+        let folder = scratch.appendingPathComponent("metadata-check-" + String(index))
+        defer { try? FileManager.default.removeItem(at: folder) }
+        return try isAppleDouble(extractStoredEntry(index, in: archive, into: folder))
+    }
+
+    /// Read a raw entry in isolation: the filtered listing can hide a retained
+    /// lookalike or a companion whose target was removed by this write.
+    private static func extractStoredEntry(_ index: UInt32, in archive: SevenZipArchive, into folder: URL) throws -> URL {
+        guard let rawPath = sz_entry_path(archive.handle.ref, index) else {
+            throw SevenZipError.writeFailed("Could not read stored entry's path")
+        }
         let relative = String(cString: rawPath).split(separator: "/")
             .filter { $0 != "." && $0 != ".." }.joined(separator: "/")
-        let folder = scratch.appendingPathComponent("metadata-check-" + String(index))
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        var error: UnsafeMutablePointer<CChar>?
-        let target = sz_sidecar_target(archive.handle.ref, index)
-        guard target >= 0, let targetPath = sz_entry_path(archive.handle.ref, UInt32(target)) else { return false }
-        if !archive.hasPassword,
-           try archive.entries.contains(where: { $0.index == UInt32(target) && $0.isEncrypted }) {
+        if !archive.hasPassword, sz_entry_is_encrypted(archive.handle.ref, index) {
             throw SevenZipError.passwordMissing
         }
-        let targetRelative = String(cString: targetPath).split(separator: "/")
-            .filter { $0 != "." && $0 != ".." }.joined(separator: "/")
-        let indices = [UInt32(target), index].sorted()
-        let result = indices.withUnsafeBufferPointer {
-            sz_extract_entries(archive.handle.ref, $0.baseAddress, UInt32($0.count), folder.path, nil, nil, &error)
-        }
+        var error: UnsafeMutablePointer<CChar>?
+        let result = sz_extract_entry(archive.handle.ref, index, folder.path, &error)
         defer { if let error { free(error) } }
         if result != SZ_EXTRACT_OK {
             if result == SZ_EXTRACT_WRONG_PASSWORD { throw SevenZipError.passwordWrong }
-            throw SevenZipError.writeFailed(error.map { String(cString: $0) } ?? "Could not verify stored metadata")
+            throw SevenZipError.writeFailed(error.map { String(cString: $0) } ?? "Could not read stored entry")
         }
-        let file = folder.appendingPathComponent(relative)
-        let attributes = try? FileManager.default.attributesOfItem(atPath: file.path)
-        if attributes == nil {
-            // A valid sidecar is consumed when the extractor folds it onto its
-            // target. A lookalike stays on disk and must be kept as user data.
-            return FileManager.default.fileExists(atPath: folder.appendingPathComponent(targetRelative).path)
-        }
-        guard attributes?[.type] as? FileAttributeType == .typeRegular else { return false }
+        return folder.appendingPathComponent(relative)
+    }
+
+    private static func isAppleDouble(_ file: URL) throws -> Bool {
+        let attributes = try FileManager.default.attributesOfItem(atPath: file.path)
+        guard attributes[.type] as? FileAttributeType == .typeRegular else { return false }
         let handle = try FileHandle(forReadingFrom: file)
         defer { try? handle.close() }
-        let header = try handle.read(upToCount: 26) ?? Data()
-        return header.count == 26 && header.prefix(8) == Data([0, 5, 0x16, 7, 0, 2, 0, 0])
+        return isAppleDoubleHeader(try handle.read(upToCount: 26) ?? Data())
+    }
+
+    private static func isAppleDoubleHeader(_ data: Data) -> Bool {
+        data.count >= 26 && data.prefix(8) == Data([0, 5, 0x16, 7, 0, 2, 0, 0])
+    }
+
+    private static func sidecarTargetPath(for path: String) -> String? {
+        var parts = path.split(separator: "/")
+        guard let name = parts.popLast(), name.hasPrefix("._"), name.count > 2 else { return nil }
+        if parts.first == "__MACOSX" { parts.removeFirst() }
+        return (parts + [name.dropFirst(2)]).joined(separator: "/")
     }
 
     // MARK: - Save As
@@ -379,6 +437,7 @@ extension SevenZipArchive {
         _ items: [ResolvedItem],
         from archive: SevenZipArchive,
         into scratch: URL,
+        excludeMacMetadata: Bool,
         progress: SevenZipArchive.ProgressHandler?
     ) throws -> [ResolvedItem] {
         let fm = FileManager.default
@@ -389,14 +448,19 @@ extension SevenZipArchive {
         // Hidden ones (AppleDouble sidecars, the `__MACOSX/` mirror) have no entry
         // of their own: extracting what they describe brings them along.
         var kept: [(entry: SevenZipEntry, path: String)] = []
-        var hidden: [UInt32] = []
+        var hidden: [(index: UInt32, path: String)] = []
         var additions: [ResolvedItem] = []
         for item in items {
             switch item {
             case .keep(let index):
-                if let entry = byIndex[index] { kept.append((entry, entry.path)) } else { hidden.append(index) }
+                if let entry = byIndex[index] { kept.append((entry, entry.path)) } else {
+                    guard let raw = sz_entry_path(archive.handle.ref, index) else {
+                        throw SevenZipError.writeFailed("Could not read stored entry's path")
+                    }
+                    hidden.append((index, String(cString: raw)))
+                }
             case .move(let index, let path):
-                if let entry = byIndex[index] { kept.append((entry, path)) } else { hidden.append(index) }
+                if let entry = byIndex[index] { kept.append((entry, path)) } else { hidden.append((index, path)) }
             default:
                 additions.append(item)
             }
@@ -448,21 +512,29 @@ extension SevenZipArchive {
             }
         }
 
-        // A hidden entry still on disk afterwards was named like a sidecar without
-        // being one, so folding it failed and it came out as itself. Looked up by
-        // its stored path: the listing leaves it out, and so do Foundation's
-        // directory listings whenever a `._name` stands beside `name`.
-        for index in hidden {
-            guard let stored = sz_entry_path(archive.handle.ref, index) else { continue }
-            // sanitized the way the extraction does: no empty, "." or ".." parts
+        // Content verification can retain entries hidden by the reader's name
+        // index. In an excluding Save As, materialize those raw bytes separately
+        // so an old association cannot fold a newly orphaned companion away.
+        for (index, path) in hidden {
+            guard let stored = sz_entry_path(archive.handle.ref, index) else {
+                throw SevenZipError.writeFailed("Could not read stored entry's path")
+            }
             let relative = String(cString: stored).split(separator: "/")
                 .filter { $0 != "." && $0 != ".." }.joined(separator: "/")
-            let file = shared.appendingPathComponent(relative)
-            guard !relative.isEmpty,
-                  let attributes = try? fm.attributesOfItem(atPath: file.path),
-                  attributes[.type] as? FileAttributeType != .typeDirectory else { continue }
+            var file = shared.appendingPathComponent(relative)
+            if sz_entry_is_directory(archive.handle.ref, index) {
+                if excludeMacMetadata || fm.fileExists(atPath: file.path) {
+                    rebuilt.append(.addDirectory(archivePath: path, diskPath: nil,
+                        modificationDate: nil, posixPermissions: nil))
+                }
+                continue
+            }
+            if excludeMacMetadata {
+                file = try extractStoredEntry(index, in: archive,
+                    into: scratch.appendingPathComponent("retained-" + String(index)))
+            } else if !fm.fileExists(atPath: file.path) { continue }
             rebuilt.append(.addFile(
-                archivePath: relative, diskPath: file,
+                archivePath: path, diskPath: file,
                 modificationDate: nil, posixPermissions: nil))
         }
 
